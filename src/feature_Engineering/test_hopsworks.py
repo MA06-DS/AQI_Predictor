@@ -1,12 +1,13 @@
 import hopsworks
+import os
 
 # Replace these with your own values
 PROJECT_NAME = "anaskaaqi"
-API_KEY = "meoEfzwtQ1qJf3W5.pWfDoVuRvsVFwnq1r4wmbwlblutJceofeF2BTdzKJ03G3iwRnzerow7Vn07tkQgz"
+API_KEY = os.getenv("HOPSWORKS_API_KEY")
 
 project = hopsworks.login(
-    project="anaskaaqi",
-    api_key_value="meoEfzwtQ1qJf3W5.pWfDoVuRvsVFwnq1r4wmbwlblutJceofeF2BTdzKJ03G3iwRnzerow7Vn07tkQgz"
+    project=PROJECT_NAME,
+    api_key_value=API_KEY
 )
 
 print("=" * 50)
