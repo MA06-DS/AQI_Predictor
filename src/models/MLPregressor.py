@@ -3,10 +3,10 @@ import joblib
 import hopsworks
 import numpy as np
 
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.multioutput import MultiOutputRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.ensemble import HistGradientBoostingRegressor
+
 
 # ==========================================
 # 1. Connect to Hopsworks
@@ -51,8 +51,8 @@ print("y:", y.shape)
 # 4. Convert to NumPy
 # ==========================================
 
-X = X.values
-y = y.values
+X = X.values.astype(np.float32)
+y = y.values.astype(np.float32)
 
 
 # ==========================================
@@ -80,42 +80,58 @@ print("Testing    :", X_test.shape, y_test.shape)
 
 
 # ==========================================
-# 6. Create Random Forest
+# 6. Scale Input Features
 # ==========================================
 
-base_model = HistGradientBoostingRegressor(
+print("\nScaling features...")
+
+scaler = StandardScaler()
+
+X_train = scaler.fit_transform(X_train).astype(np.float32)
+X_val = scaler.transform(X_val).astype(np.float32)
+X_test = scaler.transform(X_test).astype(np.float32)
+
+print("Feature scaling completed!")
+
+
+# ==========================================
+# 7. Create Neural Network
+# ==========================================
+
+model = MLPRegressor(
+    hidden_layer_sizes=(64, 32),
+    activation="relu",
+    solver="adam",
+    learning_rate_init=0.001,
     max_iter=100,
-    learning_rate=0.05,
-    max_leaf_nodes=15,
-    min_samples_leaf=20,
-    random_state=42
-)
-
-model = MultiOutputRegressor(
-    base_model,
-    n_jobs=1
+    batch_size=64,
+    early_stopping=True,
+    validation_fraction=0.10,
+    n_iter_no_change=10,
+    random_state=42,
+    verbose=True
 )
 
 
 # ==========================================
-# 7. Train
+# 8. Train
 # ==========================================
 
-print("\nTraining Random Forest...")
-print("20 trees")
-print("Maximum depth: 20")
-print("CPU workers: 1")
+print("\nTraining MLP Neural Network...")
+print("Architecture: 26 → 64 → 32 → 72")
+print("Batch size: 64")
+print("Maximum iterations: 100")
 
 model.fit(
     X_train,
     y_train
 )
 
-print("Random Forest training completed!")
+print("\nMLP training completed!")
 
 
 # ==========================================
-# 8. Validation
+# 9. Validation Prediction
 # ==========================================
 
 y_val_pred = model.predict(X_val)
@@ -148,7 +164,7 @@ print(f"R²   : {val_r2:.4f}")
 
 
 # ==========================================
-# 9. Test
+# 10. Test Prediction
 # ==========================================
 
 y_test_pred = model.predict(X_test)
@@ -181,7 +197,7 @@ print(f"R²   : {test_r2:.4f}")
 
 
 # ==========================================
-# 10. 72-Hour Horizon Performance
+# 11. 72-Hour Horizon Performance
 # ==========================================
 
 print("\n===================================")
@@ -218,7 +234,7 @@ for i in range(72):
 
 
 # ==========================================
-# 11. Save Model
+# 12. Save Model + Scaler
 # ==========================================
 
 os.makedirs(
@@ -226,15 +242,22 @@ os.makedirs(
     exist_ok=True
 )
 
-model_path = "models/aqi_72_hour_random_forest.pkl"
+model_path = "models/aqi_72_hour_mlp.pkl"
+scaler_path = "models/aqi_72_hour_mlp_scaler.pkl"
 
 joblib.dump(
     model,
     model_path
 )
 
+joblib.dump(
+    scaler,
+    scaler_path
+)
+
 print("\n===================================")
 print("MODEL SAVED")
 print("===================================")
 
-print(model_path)
+print("Model :", model_path)
+print("Scaler:", scaler_path)

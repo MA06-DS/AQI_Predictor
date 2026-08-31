@@ -3,10 +3,10 @@ import joblib
 import hopsworks
 import numpy as np
 
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import ExtraTreesRegressor
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.ensemble import HistGradientBoostingRegressor
+
 
 # ==========================================
 # 1. Connect to Hopsworks
@@ -56,7 +56,7 @@ y = y.values
 
 
 # ==========================================
-# 5. Chronological Split
+# 5. Chronological Train/Validation/Test Split
 # ==========================================
 
 n = len(X)
@@ -80,19 +80,34 @@ print("Testing    :", X_test.shape, y_test.shape)
 
 
 # ==========================================
-# 6. Create Random Forest
+# 6. Create Lightweight Model
 # ==========================================
 
-base_model = HistGradientBoostingRegressor(
-    max_iter=100,
-    learning_rate=0.05,
-    max_leaf_nodes=15,
-    min_samples_leaf=20,
-    random_state=42
+base_model = ExtraTreesRegressor(
+
+    # Reduced from 200 to 10
+    n_estimators=10,
+
+    # Limit tree size to reduce RAM usage
+    max_depth=10,
+
+    # Prevent very small splits
+    min_samples_split=5,
+
+    # Prevent very small leaves
+    min_samples_leaf=2,
+
+    random_state=42,
+
+    # IMPORTANT: only use one CPU worker
+    n_jobs=1
 )
 
 model = MultiOutputRegressor(
+
     base_model,
+
+    # IMPORTANT: only train one output model at a time
     n_jobs=1
 )
 
@@ -101,21 +116,21 @@ model = MultiOutputRegressor(
 # 7. Train
 # ==========================================
 
-print("\nTraining Random Forest...")
-print("20 trees")
-print("Maximum depth: 20")
-print("CPU workers: 1")
+print("\nTraining model...")
+print("Using 10 trees per forecast horizon")
+print("Using 1 CPU worker")
+print("This is configured for ~4 GB RAM")
 
 model.fit(
     X_train,
     y_train
 )
 
-print("Random Forest training completed!")
+print("Model training completed!")
 
 
 # ==========================================
-# 8. Validation
+# 8. Validation Prediction
 # ==========================================
 
 y_val_pred = model.predict(X_val)
@@ -148,7 +163,7 @@ print(f"R²   : {val_r2:.4f}")
 
 
 # ==========================================
-# 9. Test
+# 9. Test Prediction
 # ==========================================
 
 y_test_pred = model.predict(X_test)
@@ -181,7 +196,7 @@ print(f"R²   : {test_r2:.4f}")
 
 
 # ==========================================
-# 10. 72-Hour Horizon Performance
+# 10. Evaluate Each Forecast Horizon
 # ==========================================
 
 print("\n===================================")
@@ -226,7 +241,7 @@ os.makedirs(
     exist_ok=True
 )
 
-model_path = "models/aqi_72_hour_random_forest.pkl"
+model_path = "models/aqi_72_hour_model_extratrees.pkl"
 
 joblib.dump(
     model,
