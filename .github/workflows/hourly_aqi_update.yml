@@ -28,18 +28,20 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v6
-
-
+      - name: Checkout repository
+        uses: actions/checkout@v6
       # ==========================================
       # 2. Setup Python 3.11
       # ==========================================
-
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
 
+      
+
+      
 
       # ==========================================
       # 3. Upgrade pip
