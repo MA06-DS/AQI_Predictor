@@ -1,15 +1,32 @@
+# 
+
 import requests
-from src.data_collection.config import API_KEY
+import json
+
+API_KEY = "1e566909a522ef4cf8c876efeed0e3ed0be5a3d9788de49b01192959a56f900b"
 
 lat = 24.8607
 lon = 67.0011
 
-url = (
-    f"https://api.openweathermap.org/data/2.5/weather?"
-    f"lat={lat}&lon={lon}&appid={API_KEY}&units=metric"
-)
+url = "https://api.openaq.org/v3/locations"
 
-response = requests.get(url)
+headers = {
+    "X-API-Key": API_KEY
+}
 
-print("Status Code:", response.status_code)
-print(response.json())
+params = {
+    "coordinates": f"{lat},{lon}",
+    "radius": 25000,   # 25 km
+    "limit": 100
+}
+
+response = requests.get(url, headers=headers, params=params)
+
+if response.status_code == 200:
+    data = response.json()
+
+    print(json.dumps(data, indent=4))
+
+else:
+    print("Error:", response.status_code)
+    print(response.text)
