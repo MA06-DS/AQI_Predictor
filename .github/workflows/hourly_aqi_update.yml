@@ -25,9 +25,6 @@ jobs:
       # ==========================================
       # 1. Checkout repository
       # ==========================================
-
-      - name: Checkout repository
-        uses: actions/checkout@v6
       - name: Checkout repository
         uses: actions/checkout@v6
       # ==========================================
