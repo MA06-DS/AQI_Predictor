@@ -1,49 +1,48 @@
 # ============================================================
-# AQI HOURLY CI/CD FEATURE UPDATE
+# KARACHI AQI - HOURLY CI/CD DATA PIPELINE (UPSERT DESIGN)
 # ============================================================
 #
-# Sources:
-#   1. Open-Meteo -> hourly weather
-#   2. OpenAQ     -> hourly PM2.5
+# PURPOSE
+# -------
+# Run this script once every hour from GitHub Actions / CI/CD.
 #
-# OpenAQ:
-#   Sensor: 6135426
-#   Location: Aga Khan University Main Campus
+# WHY THIS VERSION IS DIFFERENT
+# ------------------------------
+# The previous version only ever INSERTED brand-new rows.
+# That meant every row's `target_aqi_1 ... target_aqi_72`
+# columns were frozen at whatever was known at insert time.
+# Since the AQI 72 hours in the future doesn't exist yet when
+# a row is first written, those targets stayed NULL forever.
 #
-# Hopsworks:
-#   Project: anaskaaqi
-#   Feature View: aqi_72_hour_forecast
-#   Version: 2
+# This version instead:
 #
-# Purpose:
-#   Run this file every hour from CI/CD.
+#   1. Reads the last ~96-120 rows from Hopsworks as context.
+#   2. Fetches the newly missing hour(s) from Open-Meteo/OpenAQ.
+#   3. Combines history + new data and recalculates lag and
+#      rolling features over that combined window.
+#   4. Recalculates target_aqi_1..72 for the WHOLE combined
+#      window using a plain row-based shift (the same way
+#      lag/rolling features are computed). This naturally fills
+#      in targets for older rows now that the AQI needed to
+#      compute them has finally arrived.
+#   5. target_aqi_1 should be NULL only for the single most
+#      recent row (assuming no gaps in AQI coverage).
+#   6. target_aqi_72 is naturally NULL for the most recent 72
+#      rows, since that far into the future doesn't exist yet.
+#   7. UPSERTS (not just inserts) the affected rows back into
+#      Hopsworks, keyed on `datetime_local`, so older rows get
+#      their targets patched in-place.
+#   8. Net effect: every hourly run backfills targets for rows
+#      up to 72 hours in the past, in addition to adding the
+#      newest row.
 #
-# Pipeline:
-#
-#   OpenAQ + Open-Meteo
-#          ↓
-#      hourly data
-#          ↓
-#   merge using datetime_local
-#          ↓
-#   calendar features
-#          ↓
-#   lag features
-#          ↓
-#   rolling features
-#          ↓
-#   target_aqi_1 ... target_aqi_72
-#          ↓
-#   Hopsworks Feature Group
-#
-# IMPORTANT:
-#   We recompute a rolling window instead of only creating
-#   one row because newly available AQI values change:
-#
-#       aqi_lag_*
-#       aqi_mean_*
-#       aqi_std_*
-#       target_aqi_1 ... target_aqi_72
+# REQUIREMENT
+# -----------
+# For step 7 to actually behave as an upsert (rather than
+# creating duplicate rows), the Hopsworks Feature Group must
+# be Hudi-backed with `datetime_local` (or an equivalent
+# timestamp column) declared as its primary key. This script
+# checks for that and warns loudly if it isn't set up that way.
 #
 # ============================================================
 
@@ -54,14 +53,11 @@
 
 import os
 import sys
-import time
 import requests
 import numpy as np
 import pandas as pd
+from datetime import datetime
 import hopsworks
-
-from pathlib import Path
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 
@@ -72,2458 +68,1082 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-HOPSWORKS_API_KEY = os.getenv(
-    "HOPSWORKS_API_KEY"
-)
-
-OPENAQ_API_KEY = os.getenv(
-    "OPENAQ_API_KEY"
-)
-
-
-if not HOPSWORKS_API_KEY:
-    raise RuntimeError(
-        "HOPSWORKS_API_KEY is not set."
-    )
-
-
-if not OPENAQ_API_KEY:
-    raise RuntimeError(
-        "OPENAQ_API_KEY is not set."
-    )
-
-
 # ============================================================
 # 3. CONFIGURATION
 # ============================================================
 
 PROJECT_NAME = "anaskaaqi"
 
-FEATURE_VIEW_NAME = "aqi_72_hour_forecast"
+HOPSWORKS_API_KEY = os.getenv("HOPSWORKS_API_KEY")
+OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY")
 
-FEATURE_VIEW_VERSION = 2
+if not HOPSWORKS_API_KEY:
+    raise RuntimeError("HOPSWORKS_API_KEY is not set.")
+
+if not OPENAQ_API_KEY:
+    raise RuntimeError("OPENAQ_API_KEY is not set.")
 
 
-# ------------------------------------------------------------
-# Karachi
-# ------------------------------------------------------------
+# ============================================================
+# 4. KARACHI CONFIGURATION
+# ============================================================
 
 CITY = "Karachi"
-
 LATITUDE = 24.8607
-
 LONGITUDE = 67.0011
-
 TIMEZONE = "Asia/Karachi"
 
 
-# ------------------------------------------------------------
-# OpenAQ
-# ------------------------------------------------------------
+# ============================================================
+# 5. FIXED OPENAQ SOURCE
+# ============================================================
 
-OPENAQ_SENSOR_ID = 6135426
-
-OPENAQ_LOCATION_NAME = (
-    "Aga Khan University Main Campus"
-)
-
-PM25_PARAMETER_ID = 2
+OPENAQ_LOCATION_ID = 6135426
+OPENAQ_LOCATION_NAME = "Aga Khan University Main Campus"
+OPENAQ_SENSOR_ID = 14744851
+OPENAQ_PARAMETER = "pm25"
 
 
-OPENAQ_BASE_URL = (
-    "https://api.openaq.org/v3"
-)
+# ============================================================
+# 6. API ENDPOINTS
+# ============================================================
+
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPENAQ_URL = "https://api.openaq.org/v3"
 
 
-# ------------------------------------------------------------
-# Open-Meteo
-# ------------------------------------------------------------
+# ============================================================
+# 7. HOPSWORKS CONFIGURATION
+# ============================================================
 
-OPEN_METEO_URL = (
-    "https://api.open-meteo.com/v1/forecast"
-)
+FEATURE_GROUP_NAME = "aqi_training_features"
+FEATURE_GROUP_VERSION = 2
+FEATURE_VIEW_NAME = "aqi_72_hour_forecast"
+FEATURE_VIEW_VERSION = 2
+
+# Primary key expected on the feature group so that fg.insert()
+# behaves as an upsert instead of an append.
+EXPECTED_PRIMARY_KEY = "datetime_local"
 
 
-# ------------------------------------------------------------
-# Number of historical hours to retrieve
+# ============================================================
+# 8. HISTORY / UPSERT WINDOW CONFIGURATION
+# ============================================================
 #
-# We need more than 72 because:
+# HISTORY_READ_ROWS
+#   How many of the most recent Hopsworks rows we pull down as
+#   context every run. Needs to comfortably cover:
+#     - lag_24 / rolling_24  (needs 24 rows of pure lookback)
+#     - a reasonable margin for gaps in the source data
 #
-#   lag_24
-#   rolling_24
-#   target_72
+# LOOKBACK_BUFFER_ROWS
+#   The first N rows of that read history are used ONLY to give
+#   the lag/rolling calculations something to look back on. They
+#   are never themselves re-upserted, because we can't guarantee
+#   *their* lag/rolling had a full 24-row lookback within our
+#   read window (their true lookback lives further back in
+#   Hopsworks than what we bothered to read).
 #
-# all depend on surrounding observations.
+# Everything from position LOOKBACK_BUFFER_ROWS onward (plus all
+# newly fetched rows) is a genuine "upsert candidate": either a
+# brand-new row, or an existing row whose target_aqi_* columns
+# may have just become fillable.
 #
-# 96 gives us a safe buffer.
-# ------------------------------------------------------------
+# ============================================================
 
-LOOKBACK_HOURS = 96
-
-
-# ------------------------------------------------------------
-# Target horizon
-# ------------------------------------------------------------
-
-MAX_TARGET_HORIZON = 72
+HISTORY_READ_ROWS = 120
+LOOKBACK_BUFFER_ROWS = 24
 
 
-# ------------------------------------------------------------
-# Feature windows
-# ------------------------------------------------------------
+# ============================================================
+# 9. FEATURE COLUMNS
+# ============================================================
 
-LAG_HOURS = [
-    1,
-    3,
-    6,
-    12,
-    24
-]
-
-
-ROLLING_WINDOWS = [
-    6,
-    12,
-    24
+FEATURE_COLUMNS = [
+    "temperature", "humidity", "pressure", "wind_speed",
+    "wind_direction", "precipitation", "cloud_cover",
+    "pm25", "aqi",
+    "hour", "day", "month", "year", "day_of_week", "is_weekend",
+    "aqi_lag_1", "aqi_lag_3", "aqi_lag_6", "aqi_lag_12", "aqi_lag_24",
+    "aqi_mean_6", "aqi_std_6",
+    "aqi_mean_12", "aqi_std_12",
+    "aqi_mean_24", "aqi_std_24",
 ]
 
 
 # ============================================================
-# 4. FINAL SCHEMA
+# 10. TARGET COLUMNS
 # ============================================================
 
-BASE_COLUMNS = [
-
-    "datetime_local",
-
-    "temperature",
-
-    "humidity",
-
-    "pressure",
-
-    "wind_speed",
-
-    "wind_direction",
-
-    "precipitation",
-
-    "cloud_cover",
-
-    "datetime_utc",
-
-    "pm25",
-
-    "aqi",
-
-    "hour",
-
-    "day",
-
-    "month",
-
-    "year",
-
-    "day_of_week",
-
-    "is_weekend",
-
-    "aqi_lag_1",
-
-    "aqi_lag_3",
-
-    "aqi_lag_6",
-
-    "aqi_lag_12",
-
-    "aqi_lag_24",
-
-    "aqi_mean_6",
-
-    "aqi_std_6",
-
-    "aqi_mean_12",
-
-    "aqi_std_12",
-
-    "aqi_mean_24",
-
-    "aqi_std_24",
-
-]
+TARGET_COLUMNS = [f"target_aqi_{i}" for i in range(1, 73)]
 
 
-TARGET_COLUMNS = [
+# ============================================================
+# 11. FINAL COLUMNS
+# ============================================================
 
-    f"target_aqi_{i}"
-
-    for i in range(
-        1,
-        MAX_TARGET_HORIZON + 1
-    )
-
-]
-
-
-FINAL_SCHEMA = (
-    BASE_COLUMNS
-    +
-    TARGET_COLUMNS
+FINAL_COLUMNS = (
+    ["datetime_local", "datetime_utc"] + FEATURE_COLUMNS + TARGET_COLUMNS
 )
 
 
 # ============================================================
-# 5. GET CURRENT KARACHI HOUR
+# 12. HTTP SESSION
 # ============================================================
 
-def get_current_hour():
-
-    now = pd.Timestamp.now(
-        tz=TIMEZONE
-    )
-
-    return now.floor("h")
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "Karachi-AQI-Predictor/1.0"})
 
 
 # ============================================================
-# 6. GET UPDATE WINDOW
+# 13. TIMESTAMP HELPERS
 # ============================================================
 
-def get_update_window():
+def normalize_local_timestamp(value):
+    """Convert a timestamp into a timezone-naive Karachi local timestamp."""
+    if value is None:
+        return pd.NaT
+    try:
+        ts = pd.to_datetime(value, format="mixed", errors="coerce")
+        if pd.isna(ts):
+            return pd.NaT
+        if getattr(ts, "tzinfo", None) is not None:
+            ts = ts.tz_convert(TIMEZONE).tz_localize(None)
+        return ts
+    except Exception:
+        try:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return pd.NaT
+            return ts.tz_convert(TIMEZONE).tz_localize(None)
+        except Exception:
+            return pd.NaT
 
-    current_hour = (
-        get_current_hour()
-    )
 
-    start = (
-        current_hour
-        - pd.Timedelta(
-            hours=LOOKBACK_HOURS
-        )
-    )
+def normalize_utc_timestamp(value):
+    """Convert a timestamp into a timezone-naive UTC timestamp."""
+    if value is None:
+        return pd.NaT
+    try:
+        ts = pd.to_datetime(value, format="mixed", errors="coerce")
+        if pd.isna(ts):
+            return pd.NaT
+        if getattr(ts, "tzinfo", None) is None:
+            ts = ts.tz_localize(TIMEZONE)
+        return ts.tz_convert("UTC").tz_localize(None)
+    except Exception:
+        return pd.NaT
 
-    # We only process completed hours.
-    end = current_hour
 
-    print()
-    print("=" * 60)
-    print("UPDATE WINDOW")
-    print("=" * 60)
-
-    print(
-        "Current Karachi hour:",
-        current_hour
-    )
-
-    print(
-        "Fetch from:",
-        start
-    )
-
-    print(
-        "Fetch until:",
-        end
-    )
-
-    return start, end
+def get_current_local_hour():
+    now = pd.Timestamp.now(tz=TIMEZONE)
+    return now.floor("h").tz_localize(None)
 
 
 # ============================================================
-# 7. OPEN-METEO
+# 14. FETCH OPEN-METEO
 # ============================================================
 
-def fetch_openmeteo(
-    start,
-    end
-):
+def fetch_open_meteo(start_local, end_local):
+    print("\n" + "=" * 70)
+    print("FETCHING OPEN-METEO WEATHER")
+    print("=" * 70)
 
-    print()
-    print("=" * 60)
-    print("FETCHING OPEN-METEO")
-    print("=" * 60)
+    start_local = pd.Timestamp(start_local)
+    end_local = pd.Timestamp(end_local)
 
     params = {
-
-        "latitude":
-            LATITUDE,
-
-        "longitude":
-            LONGITUDE,
-
-        "start_date":
-            start.strftime(
-                "%Y-%m-%d"
-            ),
-
-        "end_date":
-            end.strftime(
-                "%Y-%m-%d"
-            ),
-
+        "latitude": LATITUDE,
+        "longitude": LONGITUDE,
+        "start_date": start_local.strftime("%Y-%m-%d"),
+        "end_date": end_local.strftime("%Y-%m-%d"),
         "hourly": ",".join([
-
-            "temperature_2m",
-
-            "relative_humidity_2m",
-
-            "pressure_msl",
-
-            "wind_speed_10m",
-
-            "wind_direction_10m",
-
-            "precipitation",
-
-            "cloud_cover"
-
+            "temperature_2m", "relative_humidity_2m", "pressure_msl",
+            "wind_speed_10m", "wind_direction_10m", "precipitation",
+            "cloud_cover",
         ]),
-
-        "timezone":
-            TIMEZONE,
-
-        "temperature_unit":
-            "celsius",
-
-        "wind_speed_unit":
-            "kmh",
-
-        "precipitation_unit":
-            "mm"
-
+        "timezone": TIMEZONE,
+        "temperature_unit": "celsius",
+        "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
     }
 
-
-    response = requests.get(
-
-        OPEN_METEO_URL,
-
-        params=params,
-
-        timeout=120
-
-    )
-
-
+    response = SESSION.get(OPEN_METEO_URL, params=params, timeout=120)
     response.raise_for_status()
-
-
     payload = response.json()
 
-
     if "hourly" not in payload:
-
-        raise RuntimeError(
-            "Open-Meteo did not return hourly data."
-        )
-
+        raise RuntimeError("Open-Meteo did not return hourly data.")
 
     hourly = payload["hourly"]
 
-
     weather = pd.DataFrame({
-
-        "datetime_local":
-            hourly["time"],
-
-        "temperature":
-            hourly["temperature_2m"],
-
-        "humidity":
-            hourly[
-                "relative_humidity_2m"
-            ],
-
-        "pressure":
-            hourly[
-                "pressure_msl"
-            ],
-
-        "wind_speed":
-            hourly[
-                "wind_speed_10m"
-            ],
-
-        "wind_direction":
-            hourly[
-                "wind_direction_10m"
-            ],
-
-        "precipitation":
-            hourly[
-                "precipitation"
-            ],
-
-        "cloud_cover":
-            hourly[
-                "cloud_cover"
-            ]
-
+        "datetime_local": hourly["time"],
+        "temperature": hourly["temperature_2m"],
+        "humidity": hourly["relative_humidity_2m"],
+        "pressure": hourly["pressure_msl"],
+        "wind_speed": hourly["wind_speed_10m"],
+        "wind_direction": hourly["wind_direction_10m"],
+        "precipitation": hourly["precipitation"],
+        "cloud_cover": hourly["cloud_cover"],
     })
 
-
-    # --------------------------------------------------------
-    # Local datetime
-    # --------------------------------------------------------
-
-    weather[
-        "datetime_local"
-    ] = pd.to_datetime(
-        weather[
-            "datetime_local"
-        ]
+    weather["datetime_local"] = pd.to_datetime(
+        weather["datetime_local"], errors="coerce"
     )
-
-
-    # --------------------------------------------------------
-    # Filter exact requested window
-    # --------------------------------------------------------
-
+    weather = weather[weather["datetime_local"].notna()]
     weather = weather[
-        (
-            weather[
-                "datetime_local"
-            ]
-            >= start.tz_localize(None)
-        )
-        &
-        (
-            weather[
-                "datetime_local"
-            ]
-            < end.tz_localize(None)
-        )
+        (weather["datetime_local"] >= start_local)
+        & (weather["datetime_local"] <= end_local)
     ]
 
-
-    # --------------------------------------------------------
-    # UTC datetime
-    # --------------------------------------------------------
-
-    local_aware = (
-        weather[
-            "datetime_local"
-        ]
-        .dt.tz_localize(
-            TIMEZONE
-        )
-    )
-
-
-    weather[
-        "datetime_utc"
-    ] = (
-        local_aware
+    weather["datetime_utc"] = (
+        weather["datetime_local"]
+        .dt.tz_localize(TIMEZONE)
         .dt.tz_convert("UTC")
         .dt.tz_localize(None)
     )
 
-
-    print(
-        "Open-Meteo rows:",
-        len(weather)
-    )
-
-
-    return weather
+    print("Open-Meteo rows:", len(weather))
+    return weather.reset_index(drop=True)
 
 
 # ============================================================
-# 8. OPENAQ
+# 15. FETCH OPENAQ
 # ============================================================
 
-def fetch_openaq(
-    start,
-    end
-):
+def fetch_openaq_sensor(start_local, end_local):
+    print("\n" + "=" * 70)
+    print("FETCHING OPENAQ PM2.5")
+    print("=" * 70)
+    print("Location:", OPENAQ_LOCATION_ID, OPENAQ_LOCATION_NAME)
+    print("Sensor:", OPENAQ_SENSOR_ID)
+    print("Parameter:", OPENAQ_PARAMETER)
 
-    print()
-    print("=" * 60)
-    print("FETCHING OPENAQ")
-    print("=" * 60)
-
-    print(
-        "Sensor:",
-        OPENAQ_SENSOR_ID
+    start_utc = pd.Timestamp(start_local).tz_localize(TIMEZONE).tz_convert("UTC")
+    end_utc = (
+        pd.Timestamp(end_local).tz_localize(TIMEZONE).tz_convert("UTC")
+        + pd.Timedelta(hours=1)
     )
 
-    print(
-        "Location:",
-        OPENAQ_LOCATION_NAME
-    )
-
-
-    url = (
-
-        OPENAQ_BASE_URL
-
-        +
-
-        f"/sensors/"
-        f"{OPENAQ_SENSOR_ID}"
-        f"/hours"
-
-    )
-
-
-    headers = {
-
-        "X-API-Key":
-            OPENAQ_API_KEY
-
+    url = f"{OPENAQ_URL}/sensors/{OPENAQ_SENSOR_ID}/measurements/hourly"
+    headers = {"X-API-Key": OPENAQ_API_KEY}
+    params = {
+        "datetime_from": start_utc.isoformat(),
+        "datetime_to": end_utc.isoformat(),
+        "limit": 1000,
     }
 
+    response = SESSION.get(url, params=params, headers=headers, timeout=120)
 
-    # --------------------------------------------------------
-    # OpenAQ expects datetime filters.
-    # --------------------------------------------------------
+    if response.status_code == 404:
+        print("OpenAQ returned 404.")
+        return pd.DataFrame(columns=["datetime_local", "pm25"])
 
-    start_utc = (
-        start
-        .tz_convert("UTC")
-    )
+    response.raise_for_status()
+    payload = response.json()
+    results = payload.get("results", [])
+    print("Raw OpenAQ rows:", len(results))
 
-
-    end_utc = (
-        end
-        .tz_convert("UTC")
-    )
-
-
-    all_rows = []
-
-
-    page = 1
-
-
-    while True:
-
-        params = {
-
-            "datetime_from":
-                start_utc.isoformat(),
-
-            "datetime_to":
-                end_utc.isoformat(),
-
-            "limit":
-                100,
-
-            "page":
-                page
-
-        }
-
-
-        response = requests.get(
-
-            url,
-
-            params=params,
-
-            headers=headers,
-
-            timeout=120
-
-        )
-
-
-        if response.status_code == 429:
-
-            print(
-                "OpenAQ rate limit reached."
-            )
-
-            print(
-                "Waiting 10 seconds..."
-            )
-
-            time.sleep(10)
-
-            continue
-
-
-        response.raise_for_status()
-
-
-        payload = response.json()
-
-
-        results = payload.get(
-            "results",
-            []
-        )
-
-
-        if not results:
-
-            break
-
-
-        all_rows.extend(
-            results
-        )
-
-
-        if len(results) < 100:
-
-            break
-
-
-        page += 1
-
-
-        time.sleep(
-            0.5
-        )
-
-
-    if not all_rows:
-
-        raise RuntimeError(
-            "OpenAQ returned no hourly "
-            "PM2.5 data for sensor "
-            f"{OPENAQ_SENSOR_ID}."
-        )
-
+    if not results:
+        print("No OpenAQ measurements.")
+        return pd.DataFrame(columns=["datetime_local", "pm25"])
 
     rows = []
-
-
-    for row in all_rows:
-
-        value = row.get(
-            "value"
-        )
-
-
-        parameter = row.get(
-            "parameter",
-            {}
-        )
-
-
-        parameter_id = parameter.get(
-            "id"
-        )
-
-
-        if (
-            parameter_id is not None
-            and
-            parameter_id != PM25_PARAMETER_ID
-        ):
-
+    for row in results:
+        value = row.get("value")
+        if value is None:
             continue
 
-
-        period = row.get(
-            "period",
-            {}
+        period = row.get("period", {})
+        datetime_from = (
+            period.get("datetimeFrom")
+            or period.get("datetime_from")
+            or row.get("datetimeFrom")
+            or row.get("datetime")
         )
 
+        if isinstance(datetime_from, dict):
+            datetime_value = datetime_from.get("utc") or datetime_from.get("local")
+        else:
+            datetime_value = datetime_from
 
-        datetime_from = period.get(
-            "datetimeFrom",
-            {}
-        )
-
-
-        local_time = (
-            datetime_from.get(
-                "local"
-            )
-        )
-
-
-        utc_time = (
-            datetime_from.get(
-                "utc"
-            )
-        )
-
-
-        if local_time is None:
-
+        if datetime_value is None:
             continue
 
-
-        rows.append({
-
-            "datetime_local":
-                local_time,
-
-            "datetime_utc":
-                utc_time,
-
-            "pm25":
-                value
-
-        })
-
-
-    if not rows:
-
-        raise RuntimeError(
-            "OpenAQ response contained no "
-            "usable PM2.5 records."
-        )
-
-
-    aqi = pd.DataFrame(
-        rows
-    )
-
-
-    # --------------------------------------------------------
-    # Parse datetime
-    # --------------------------------------------------------
-
-    aqi[
-        "datetime_local"
-    ] = pd.to_datetime(
-        aqi[
-            "datetime_local"
-        ]
-    )
-
-
-    # Remove timezone if supplied
-    if (
-        aqi[
-            "datetime_local"
-        ].dt.tz is not None
-    ):
-
-        aqi[
-            "datetime_local"
-        ] = (
-            aqi[
-                "datetime_local"
-            ]
-            .dt.tz_localize(None)
-        )
-
-
-    # --------------------------------------------------------
-    # Numeric PM2.5
-    # --------------------------------------------------------
-
-    aqi[
-        "pm25"
-    ] = pd.to_numeric(
-        aqi[
-            "pm25"
-        ],
-        errors="coerce"
-    )
-
-
-    aqi = aqi.dropna(
-        subset=[
-            "datetime_local",
-            "pm25"
-        ]
-    )
-
-
-    # --------------------------------------------------------
-    # Remove duplicate hours
-    # --------------------------------------------------------
-
-    aqi = (
-
-        aqi
-
-        .groupby(
-            "datetime_local",
-            as_index=False
-        )
-
-        ["pm25"]
-
-        .mean()
-
-    )
-
-
-    # --------------------------------------------------------
-    # Convert PM2.5 -> AQI
-    # --------------------------------------------------------
-
-    aqi[
-        "aqi"
-    ] = aqi_from_pm25(
-        aqi[
-            "pm25"
-        ]
-    )
-
-
-    # --------------------------------------------------------
-    # Recreate UTC timestamp
-    # --------------------------------------------------------
-
-    local_aware = (
-        aqi[
-            "datetime_local"
-        ]
-        .dt.tz_localize(
-            TIMEZONE
-        )
-    )
-
-
-    aqi[
-        "datetime_utc"
-    ] = (
-        local_aware
-        .dt.tz_convert(
-            "UTC"
-        )
-        .dt.tz_localize(
-            None
-        )
-    )
-
-
-    print(
-        "OpenAQ rows:",
-        len(aqi)
-    )
-
-
-    print(
-        "PM2.5 range:",
-        aqi["pm25"].min(),
-        "to",
-        aqi["pm25"].max()
-    )
-
-
-    return aqi
-
-
-# ============================================================
-# 9. AQI FUNCTION
-# ============================================================
-
-def aqi_from_pm25(
-    pm25_series
-):
-
-    def convert(
-        concentration
-    ):
-
-        if pd.isna(
-            concentration
-        ):
-
-            return np.nan
-
+        local_timestamp = normalize_local_timestamp(datetime_value)
+        if pd.isna(local_timestamp):
+            continue
 
         try:
+            pm25_value = float(value)
+        except (TypeError, ValueError):
+            continue
 
-            concentration = float(
-                concentration
-            )
+        rows.append({"datetime_local": local_timestamp, "pm25": pm25_value})
 
-        except (
-            TypeError,
-            ValueError
-        ):
+    if not rows:
+        print("No usable OpenAQ measurements.")
+        return pd.DataFrame(columns=["datetime_local", "pm25"])
 
-            return np.nan
+    aqi = pd.DataFrame(rows)
 
+    # Multiple measurements for the same hour: take the average.
+    aqi = aqi.groupby("datetime_local", as_index=False)["pm25"].mean()
 
-        if concentration < 0:
-
-            return np.nan
-
-
-        # ----------------------------------------------------
-        # EPA PM2.5 concentration truncation
-        # ----------------------------------------------------
-
-        c = (
-            np.floor(
-                concentration * 10
-            )
-            / 10
-        )
-
-
-        # ----------------------------------------------------
-        # PM2.5 AQI breakpoints
-        # ----------------------------------------------------
-
-        breakpoints = [
-
-            (
-                0.0,
-                9.0,
-                0,
-                50
-            ),
-
-            (
-                9.1,
-                35.4,
-                51,
-                100
-            ),
-
-            (
-                35.5,
-                55.4,
-                101,
-                150
-            ),
-
-            (
-                55.5,
-                125.4,
-                151,
-                200
-            ),
-
-            (
-                125.5,
-                225.4,
-                201,
-                300
-            ),
-
-            (
-                225.5,
-                325.4,
-                301,
-                500
-            )
-
-        ]
-
-
-        for (
-
-            c_low,
-            c_high,
-            i_low,
-            i_high
-
-        ) in breakpoints:
-
-            if (
-
-                c >= c_low
-                and
-                c <= c_high
-
-            ):
-
-                aqi = (
-
-                    (
-                        i_high - i_low
-                    )
-                    /
-                    (
-                        c_high - c_low
-                    )
-                ) * (
-
-                    c - c_low
-
-                ) + i_low
-
-
-                return round(
-                    aqi
-                )
-
-
-        # ----------------------------------------------------
-        # Above maximum breakpoint
-        # ----------------------------------------------------
-
-        if c > 325.4:
-
-            return 500
-
-
-        return np.nan
-
-
-    return pm25_series.apply(
-        convert
-    )
-
-
-# ============================================================
-# 10. MERGE WEATHER + AQI
-# ============================================================
-
-def merge_sources(
-    weather,
-    aqi
-):
-
-    print()
-    print("=" * 60)
-    print("MERGING WEATHER + OPENAQ")
-    print("=" * 60)
-
-
-    data = pd.merge(
-
-        weather,
-
-        aqi[
-            [
-                "datetime_local",
-                "pm25",
-                "aqi"
-            ]
-        ],
-
-        on="datetime_local",
-
-        how="left"
-
-    )
-
-
-    data = (
-        data
-        .sort_values(
-            "datetime_local"
-        )
-        .reset_index(
-            drop=True
-        )
-    )
-
-
-    print(
-        "Merged rows:",
-        len(data)
-    )
-
-
-    print(
-        "Missing PM2.5:",
-        data[
-            "pm25"
-        ].isna().sum()
-    )
-
-
-    print(
-        "Missing AQI:",
-        data[
-            "aqi"
-        ].isna().sum()
-    )
-
-
-    return data
-
-
-# ============================================================
-# 11. CALENDAR FEATURES
-# ============================================================
-
-def create_calendar_features(
-    data
-):
-
-    data = data.copy()
-
-
-    dt = pd.to_datetime(
-        data[
-            "datetime_local"
-        ]
-    )
-
-
-    data[
-        "hour"
-    ] = dt.dt.hour
-
-
-    data[
-        "day"
-    ] = dt.dt.day
-
-
-    data[
-        "month"
-    ] = dt.dt.month
-
-
-    data[
-        "year"
-    ] = dt.dt.year
-
-
-    data[
-        "day_of_week"
-    ] = dt.dt.dayofweek
-
-
-    data[
-        "is_weekend"
-    ] = (
-
-        data[
-            "day_of_week"
-        ]
-        >= 5
-
-    ).astype(
-        int
-    )
-
-
-    return data
-
-
-# ============================================================
-# 12. LOAD HISTORICAL DATA FROM HOPSWORKS
-# ============================================================
-
-def load_hopsworks_history(
-    feature_view,
-    start,
-    end
-):
-
-    print()
-    print("=" * 60)
-    print("LOADING HISTORY FROM HOPSWORKS")
-    print("=" * 60)
-
-
-    # --------------------------------------------------------
-    # We need the previous 3 days / 72 hours to correctly
-    # construct lag and target features.
-    # --------------------------------------------------------
-
-    history_start = (
-        start
-        - pd.Timedelta(
-            hours=72
-        )
-    )
-
-
-    try:
-
-        history = (
-            feature_view
-            .get_batch_data(
-                start_time=history_start,
-                end_time=end,
-                dataframe_type="pandas",
-                transformed=False
-            )
-        )
-
-    except TypeError:
-
-        # Compatibility with older Hopsworks versions.
-
-        history = (
-            feature_view
-            .get_batch_data(
-                start_time=history_start,
-                end_time=end,
-                dataframe_type="pandas"
-            )
-        )
-
-
-    if history is None:
-
-        return pd.DataFrame()
-
-
-    history = pd.DataFrame(
-        history
-    )
-
-
-    if history.empty:
-
-        print(
-            "No historical data returned."
-        )
-
-        return history
-
-
-    if "datetime_local" not in history.columns:
-
-        raise RuntimeError(
-            "Hopsworks data does not contain "
-            "'datetime_local'."
-        )
-
-
-    history[
-        "datetime_local"
-    ] = pd.to_datetime(
-        history[
-            "datetime_local"
-        ]
-    )
-
-
-    # Remove timezone if any
-
-    if (
-        history[
-            "datetime_local"
-        ].dt.tz is not None
-    ):
-
-        history[
-            "datetime_local"
-        ] = (
-            history[
-                "datetime_local"
-            ]
-            .dt.tz_localize(None)
-        )
-
-
-    history = (
-        history
-        .sort_values(
-            "datetime_local"
-        )
-        .drop_duplicates(
-            "datetime_local",
-            keep="last"
-        )
-        .reset_index(
-            drop=True
-        )
-    )
-
-
-    print(
-        "Historical rows:",
-        len(history)
-    )
-
-
-    if not history.empty:
-
-        print(
-            "History from:",
-            history[
-                "datetime_local"
-            ].min()
-        )
-
-        print(
-            "History to:",
-            history[
-                "datetime_local"
-            ].max()
-        )
-
-
-    return history
-
-
-# ============================================================
-# 13. MERGE HISTORICAL + NEW API DATA
-# ============================================================
-
-def combine_history_and_new(
-    history,
-    new_data
-):
-
-    print()
-    print("=" * 60)
-    print("COMBINING HISTORY + NEW DATA")
-    print("=" * 60)
-
-
-    # --------------------------------------------------------
-    # Keep only raw/source columns from historical data.
-    #
-    # We deliberately recompute all derived features.
-    # --------------------------------------------------------
-
-    required_raw = [
-
-        "datetime_local",
-
-        "temperature",
-
-        "humidity",
-
-        "pressure",
-
-        "wind_speed",
-
-        "wind_direction",
-
-        "precipitation",
-
-        "cloud_cover",
-
-        "datetime_utc",
-
-        "pm25",
-
-        "aqi"
-
+    aqi = aqi[
+        (aqi["datetime_local"] >= pd.Timestamp(start_local))
+        & (aqi["datetime_local"] <= pd.Timestamp(end_local))
     ]
 
-
-    if history.empty:
-
-        combined = new_data.copy()
-
-    else:
-
-        available = [
-
-            c
-            for c in required_raw
-            if c in history.columns
-        ]
+    print("OpenAQ usable rows:", len(aqi))
+    return aqi.reset_index(drop=True)
 
 
-        history_raw = history[
-            available
-        ].copy()
+# ============================================================
+# 16. PM2.5 -> US EPA AQI
+# ============================================================
+
+def aqi_from_pm25_value(pm25):
+    if pd.isna(pm25):
+        return np.nan
+
+    try:
+        concentration = float(pm25)
+    except (TypeError, ValueError):
+        return np.nan
+
+    if concentration < 0:
+        return np.nan
+
+    # EPA PM2.5 truncation to one decimal place.
+    c = np.floor(concentration * 10) / 10
+
+    breakpoints = [
+        (0.0, 12.0, 0, 50),
+        (12.1, 35.4, 51, 100),
+        (35.5, 55.4, 101, 150),
+        (55.5, 150.4, 151, 200),
+        (150.5, 250.4, 201, 300),
+        (250.5, 350.4, 301, 400),
+        (350.5, 500.4, 401, 500),
+    ]
+
+    for c_low, c_high, i_low, i_high in breakpoints:
+        if c_low <= c <= c_high:
+            aqi = ((i_high - i_low) / (c_high - c_low)) * (c - c_low) + i_low
+            return round(aqi)
+
+    if c > 500.4:
+        return 500
+
+    return np.nan
 
 
-        combined = pd.concat(
+def calculate_aqi(data):
+    data = data.copy()
+    data["aqi"] = data["pm25"].apply(aqi_from_pm25_value)
+    return data
 
-            [
-                history_raw,
-                new_data
-            ],
 
-            ignore_index=True
+# ============================================================
+# 17. CONNECT HOPSWORKS
+# ============================================================
 
+def connect_hopsworks():
+    print("\n" + "=" * 70)
+    print("CONNECTING TO HOPSWORKS")
+    print("=" * 70)
+
+    project = hopsworks.login(project=PROJECT_NAME, api_key_value=HOPSWORKS_API_KEY)
+    print("Connected to Hopsworks.")
+
+    fs = project.get_feature_store()
+    fg = fs.get_feature_group(name=FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
+    print("Feature Group:", FEATURE_GROUP_NAME, "v", FEATURE_GROUP_VERSION)
+
+    # Upserting only works if the feature group has a primary key.
+    # Otherwise fg.insert() will silently append duplicate rows.
+    primary_key = getattr(fg, "primary_key", None)
+    if not primary_key or EXPECTED_PRIMARY_KEY not in primary_key:
+        print()
+        print("WARNING: Feature Group primary_key is", primary_key)
+        print(
+            "         Upsert-based target backfilling requires "
+            f"'{EXPECTED_PRIMARY_KEY}' to be the (or part of the) primary key."
+        )
+        print(
+            "         Without it, re-writing existing rows will create "
+            "duplicates instead of patching them in place."
         )
 
+    return project, fs, fg
 
-    # --------------------------------------------------------
-    # New API data takes priority over historical values.
-    # --------------------------------------------------------
 
-    combined = (
+# ============================================================
+# 18. READ RECENT HOPSWORKS HISTORY
+# ============================================================
 
-        combined
+def read_recent_history(fg, rows=HISTORY_READ_ROWS):
+    print("\n" + "=" * 70)
+    print("READING RECENT HOPSWORKS HISTORY")
+    print("=" * 70)
 
-        .sort_values(
-            "datetime_local"
-        )
+    try:
+        all_data = fg.read()
+    except Exception as exc:
+        print("Could not read Feature Group.")
+        print("Error:", exc)
+        raise
 
-        .drop_duplicates(
-            "datetime_local",
-            keep="last"
-        )
+    if all_data is None or all_data.empty:
+        return pd.DataFrame()
 
-        .reset_index(
-            drop=True
-        )
+    data = all_data.copy()
 
+    if "datetime_local" in data.columns:
+        data["datetime_local"] = data["datetime_local"].apply(normalize_local_timestamp)
+
+    if "datetime_utc" in data.columns:
+        data["datetime_utc"] = data["datetime_utc"].apply(normalize_utc_timestamp)
+
+    for column in ["pm25", "aqi"]:
+        if column in data.columns:
+            data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    data = (
+        data.dropna(subset=["datetime_local"])
+        .sort_values("datetime_local")
+        .drop_duplicates(subset=["datetime_local"], keep="last")
+        .reset_index(drop=True)
     )
 
+    print("Total Hopsworks rows:", len(data))
 
+    recent = data.tail(rows).copy().reset_index(drop=True)
+    print("Recent history rows read:", len(recent))
+
+    if not recent.empty:
+        print("History first:", recent["datetime_local"].min())
+        print("History last:", recent["datetime_local"].max())
+
+    return recent
+
+
+# ============================================================
+# 19. GET LAST TIMESTAMP
+# ============================================================
+
+def get_last_timestamp(fg):
+    print("\n" + "=" * 70)
+    print("FINDING LAST HOPSWORKS TIMESTAMP")
+    print("=" * 70)
+
+    try:
+        data = fg.read()
+    except Exception as exc:
+        print("Could not read Hopsworks.")
+        raise exc
+
+    if data is None or data.empty or "datetime_local" not in data.columns:
+        return None
+
+    timestamps = data["datetime_local"].apply(normalize_local_timestamp).dropna()
+
+    if timestamps.empty:
+        return None
+
+    last_timestamp = pd.Timestamp(timestamps.max())
+    print("Last Hopsworks timestamp:", last_timestamp)
+    return last_timestamp
+
+
+# ============================================================
+# 20. DETERMINE FETCH WINDOW
+# ============================================================
+
+def determine_fetch_window(last_timestamp):
+    current_hour = get_current_local_hour()
+
+    print()
+    print("Current Karachi hour:", current_hour)
+
+    if last_timestamp is None:
+        # Safety fallback only (e.g. first ever run).
+        start = current_hour - pd.Timedelta(hours=HISTORY_READ_ROWS)
+    else:
+        start = last_timestamp + pd.Timedelta(hours=1)
+
+    end = current_hour
+
+    if start > end:
+        print("\nNo new hour to process.")
+        return None, None
+
+    print("Fetch start:", start)
+    print("Fetch end:", end)
+    return start, end
+
+
+# ============================================================
+# 21. CALENDAR FEATURES
+# ============================================================
+
+def create_calendar_features(data):
+    data = data.copy()
+    dt = pd.to_datetime(data["datetime_local"], errors="coerce")
+
+    data["hour"] = dt.dt.hour.astype("int64")
+    data["day"] = dt.dt.day.astype("int64")
+    data["month"] = dt.dt.month.astype("int64")
+    data["year"] = dt.dt.year.astype("int64")
+    data["day_of_week"] = dt.dt.dayofweek.astype("int64")
+    data["is_weekend"] = (data["day_of_week"] >= 5).astype("int64")
+
+    return data
+
+
+# ============================================================
+# 22. LAG FEATURES
+# ============================================================
+
+def create_lag_features(data):
+    data = data.sort_values("datetime_local").reset_index(drop=True).copy()
+
+    for lag in [1, 3, 6, 12, 24]:
+        data[f"aqi_lag_{lag}"] = data["aqi"].shift(lag)
+
+    return data
+
+
+# ============================================================
+# 23. ROLLING FEATURES
+# ============================================================
+
+def create_rolling_features(data):
+    data = data.copy()
+
+    # shift(1) excludes the current AQI value -> no target leakage.
+    past_aqi = data["aqi"].shift(1)
+
+    for window in [6, 12, 24]:
+        data[f"aqi_mean_{window}"] = past_aqi.rolling(window=window, min_periods=window).mean()
+        data[f"aqi_std_{window}"] = past_aqi.rolling(window=window, min_periods=window).std()
+
+    return data
+
+
+# ============================================================
+# 24. TARGET COLUMNS (EXACT TIMESTAMP LOOKUP)
+# ============================================================
+
+def create_targets(data):
+    data = data.copy()
+
+    # Exact timestamp lookup so target_aqi_24 really means "24 hours
+    # later", not "the 24th next row" (which would break across gaps).
+    aqi_lookup = data.set_index("datetime_local")["aqi"]
+
+    for horizon in range(1, 73):
+
+        target_column = f"target_aqi_{horizon}"
+
+        data[target_column] = (
+            data["aqi"].shift(-horizon)
+        )
+
+        print(f"Created: {target_column}")
+
+    return data
+
+
+# ============================================================
+# 25. PREPARE NEW DATA
+# ============================================================
+
+def prepare_new_data(weather, aqi):
+    print("\n" + "=" * 70)
+    print("MERGING WEATHER + OPENAQ")
+    print("=" * 70)
+
+    if weather.empty:
+        return pd.DataFrame()
+
+    if aqi.empty:
+        print("No AQI data available.")
+        # We DO NOT create rows with NULL AQI. This is intentional.
+        return pd.DataFrame()
+
+    aqi = calculate_aqi(aqi)
+
+    before = len(aqi)
+    aqi = aqi[aqi["aqi"].notna()].copy()
+    print("OpenAQ rows removed because AQI was NULL:", before - len(aqi))
+
+    if aqi.empty:
+        print("No valid AQI rows available.")
+        return pd.DataFrame()
+
+    weather["datetime_local"] = pd.to_datetime(weather["datetime_local"], errors="coerce")
+    aqi["datetime_local"] = pd.to_datetime(aqi["datetime_local"], errors="coerce")
+
+    merged = pd.merge(
+        weather,
+        aqi[["datetime_local", "pm25", "aqi"]],
+        on="datetime_local",
+        how="inner",
+    )
+
+    # INNER JOIN -> only hours with valid AQI are kept, so we never
+    # create rows with AQI = NULL / lag = NULL / rolling = NULL.
+    print("Merged valid AQI rows:", len(merged))
+
+    if merged.empty:
+        return pd.DataFrame()
+
+    merged["datetime_utc"] = (
+        merged["datetime_local"]
+        .dt.tz_localize(TIMEZONE)
+        .dt.tz_convert("UTC")
+        .dt.tz_localize(None)
+    )
+
+    return merged.reset_index(drop=True)
+
+
+# ============================================================
+# 26. COMBINE HISTORY + NEW DATA
+# ============================================================
+
+def combine_history_and_new(history, new_data):
+    print("\n" + "=" * 70)
+    print("COMBINING RECENT HISTORY + NEW DATA")
+    print("=" * 70)
+
+    if history.empty:
+        combined = new_data.copy()
+    elif new_data.empty:
+        combined = history.copy()
+    else:
+        combined = pd.concat([history, new_data], ignore_index=True, sort=False)
+
+    if combined.empty:
+        return pd.DataFrame()
+
+    combined["datetime_local"] = combined["datetime_local"].apply(normalize_local_timestamp)
+    combined = combined[combined["datetime_local"].notna()].copy()
+
+    # Remove rows without AQI. THIS MUST HAPPEN BEFORE LAG/ROLLING.
+    if "aqi" in combined.columns:
+        combined["aqi"] = pd.to_numeric(combined["aqi"], errors="coerce")
+        before = len(combined)
+        combined = combined[combined["aqi"].notna()].copy()
+        print("Rows removed because AQI is NULL:", before - len(combined))
+
+    combined = (
+        combined.sort_values("datetime_local")
+        .drop_duplicates(subset=["datetime_local"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    print("Combined valid-AQI rows:", len(combined))
     return combined
 
 
 # ============================================================
-# 14. CREATE LAG + ROLLING FEATURES
+# 27. FEATURE ENGINEERING
 # ============================================================
 
-def create_derived_features(
-    data
-):
+def engineer_features(combined):
+    print("\n" + "=" * 70)
+    print("FEATURE ENGINEERING")
+    print("=" * 70)
 
-    print()
-    print("=" * 60)
-    print("CREATING DERIVED FEATURES")
-    print("=" * 60)
+    if combined.empty:
+        return pd.DataFrame()
 
+    data = combined.sort_values("datetime_local").reset_index(drop=True).copy()
 
-    data = (
-
-        data
-
-        .sort_values(
-            "datetime_local"
-        )
-
-        .reset_index(
-            drop=True
-        )
-
-        .copy()
-
-    )
-
-
-    # --------------------------------------------------------
-    # Lag features
-    # --------------------------------------------------------
-
-    for lag in LAG_HOURS:
-
-        data[
-            f"aqi_lag_{lag}"
-        ] = (
-
-            data[
-                "aqi"
-            ]
-            .shift(lag)
-
-        )
-
-
-    # --------------------------------------------------------
-    # Rolling features
-    #
-    # shift(1) prevents current AQI leakage.
-    # --------------------------------------------------------
-
-    previous_aqi = (
-        data[
-            "aqi"
-        ]
-        .shift(1)
-    )
-
-
-    for window in ROLLING_WINDOWS:
-
-        data[
-            f"aqi_mean_{window}"
-        ] = (
-
-            previous_aqi
-
-            .rolling(
-                window=window,
-                min_periods=window
-            )
-
-            .mean()
-
-        )
-
-
-        data[
-            f"aqi_std_{window}"
-        ] = (
-
-            previous_aqi
-
-            .rolling(
-                window=window,
-                min_periods=window
-            )
-
-            .std()
-
-        )
-
+    data = create_calendar_features(data)
+    data = create_lag_features(data)
+    data = create_rolling_features(data)
+    data = create_targets(data)
 
     return data
 
 
 # ============================================================
-# 15. CREATE 72 TARGETS
+# 28. SELECT UPSERT CANDIDATES
+# ============================================================
+#
+# This replaces the old "select_new_rows" logic. Instead of only
+# keeping rows inside [start, end] (the truly-new hours), we keep
+# every row EXCEPT the first LOOKBACK_BUFFER_ROWS rows of the
+# history we read. Those buffer rows exist solely to give lag/
+# rolling features something to look back on; their own lag/
+# rolling may not have full lookback within our limited read
+# window, so we leave them untouched in Hopsworks.
+#
+# Everything else -- old rows whose targets may have just become
+# fillable, plus brand-new rows -- is a genuine upsert candidate.
+#
 # ============================================================
 
-def create_targets(
-    data
-):
+def select_upsert_rows(engineered, history):
+    if engineered.empty:
+        return pd.DataFrame()
 
-    print()
-    print("=" * 60)
-    print("CREATING 72 TARGETS")
-    print("=" * 60)
+    if history.empty or len(history) <= LOOKBACK_BUFFER_ROWS:
+        cutoff_timestamp = engineered["datetime_local"].min()
+    else:
+        cutoff_timestamp = history["datetime_local"].iloc[LOOKBACK_BUFFER_ROWS]
 
+    candidates = engineered[engineered["datetime_local"] >= cutoff_timestamp].copy()
 
-    data = (
-        data
-        .sort_values(
-            "datetime_local"
-        )
-        .reset_index(
-            drop=True
-        )
-        .copy()
-    )
-
-
-    for horizon in range(
-        1,
-        MAX_TARGET_HORIZON + 1
-    ):
-
-        data[
-            f"target_aqi_{horizon}"
-        ] = (
-
-            data[
-                "aqi"
-            ]
-            .shift(
-                -horizon
-            )
-
-        )
-
-
-    return data
+    return candidates.sort_values("datetime_local").reset_index(drop=True)
 
 
 # ============================================================
-# 16. APPLY THE 3-DAY RULE
+# 29. CHECK REQUIRED FEATURE NULLS
 # ============================================================
 
-def apply_three_day_rule(
-    data
-):
-
-    """
-    Your stated logic:
-
-    FIRST 3 DAYS
-    -------------
-    Use the historical AQI sequence with shift-based
-    calculation.
-
-    AFTER 3 DAYS
-    ------------
-    Use datetime_local as the authoritative hourly
-    alignment.
-
-    The important part here is that the dataframe is
-    explicitly sorted and reindexed by datetime_local
-    before shift/target creation.
-
-    This avoids relying on API row order.
-    """
-
-    print()
-    print("=" * 60)
-    print("APPLYING 3-DAY AQI ALIGNMENT RULE")
-    print("=" * 60)
-
-
-    data = (
-        data
-        .sort_values(
-            "datetime_local"
-        )
-        .reset_index(
-            drop=True
-        )
-        .copy()
-    )
-
-
-    data[
-        "datetime_local"
-    ] = pd.to_datetime(
-        data[
-            "datetime_local"
-        ]
-    )
-
-
-    # --------------------------------------------------------
-    # Ensure one hourly row per local timestamp.
-    # --------------------------------------------------------
-
-    data = (
-        data
-        .drop_duplicates(
-            "datetime_local",
-            keep="last"
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # Reindex to hourly Karachi timeline.
-    #
-    # This is important once the pipeline is operating live.
-    # If OpenAQ misses one hour, we don't accidentally make
-    # shift(1) mean "previous available API row".
-    # --------------------------------------------------------
-
-    data = (
-        data
-        .set_index(
-            "datetime_local"
-        )
-        .sort_index()
-    )
-
-
-    full_index = pd.date_range(
-
-        start=data.index.min(),
-
-        end=data.index.max(),
-
-        freq="h"
-
-    )
-
-
-    data = data.reindex(
-        full_index
-    )
-
-
-    data.index.name = (
-        "datetime_local"
-    )
-
-
-    data = data.reset_index()
-
-
-    # --------------------------------------------------------
-    # Restore UTC timestamps for missing/reindexed rows.
-    # --------------------------------------------------------
-
-    local_aware = (
-        data[
-            "datetime_local"
-        ]
-        .dt.tz_localize(
-            TIMEZONE
-        )
-    )
-
-
-    data[
-        "datetime_utc"
-    ] = (
-
-        local_aware
-
-        .dt.tz_convert(
-            "UTC"
-        )
-
-        .dt.tz_localize(
-            None
-        )
-
-    )
-
-
-    # --------------------------------------------------------
-    # Recalculate calendar fields.
-    # --------------------------------------------------------
-
-    data = create_calendar_features(
-        data
-    )
-
-
-    # --------------------------------------------------------
-    # Derived features AFTER timeline alignment.
-    # --------------------------------------------------------
-
-    data = create_derived_features(
-        data
-    )
-
-
-    # --------------------------------------------------------
-    # Targets AFTER timeline alignment.
-    # --------------------------------------------------------
-
-    data = create_targets(
-        data
-    )
-
-
-    print(
-        "Aligned rows:",
-        len(data)
-    )
-
-
-    return data
-
-
-# ============================================================
-# 17. GET ONLY ROWS THAT SHOULD BE UPDATED
-# ============================================================
-
-def select_update_rows(
-    data,
-    update_start,
-    update_end
-):
-
-    data = data.copy()
-
-
-    data[
-        "datetime_local"
-    ] = pd.to_datetime(
-        data[
-            "datetime_local"
-        ]
-    )
-
-
-    # --------------------------------------------------------
-    # We update:
-    #
-    #   previous 72 hours
-    #
-    # because new AQI values affect their target columns.
-    #
-    # Plus all newly available rows.
-    # --------------------------------------------------------
-
-    target_update_start = (
-
-        update_start
-
-        - pd.Timedelta(
-            hours=MAX_TARGET_HORIZON
-        )
-
-    )
-
-
-    mask = (
-
-        data[
-            "datetime_local"
-        ]
-        >= target_update_start
-
-    ) & (
-
-        data[
-            "datetime_local"
-        ]
-        < update_end
-
-    )
-
-
-    result = data[
-        mask
-    ].copy()
-
-
-    print()
-    print("=" * 60)
-    print("ROWS TO UPSERT")
-    print("=" * 60)
-
-
-    print(
-        "Update from:",
-        target_update_start
-    )
-
-
-    print(
-        "Update until:",
-        update_end
-    )
-
-
-    print(
-        "Rows:",
-        len(result)
-    )
-
-
-    return result
-
-
-# ============================================================
-# 18. PREPARE FINAL HOPSWORKS DATA
-# ============================================================
-
-def prepare_final_data(
-    data
-):
-
-    data = data.copy()
-
-
-    # --------------------------------------------------------
-    # Replace infinities
-    # --------------------------------------------------------
-
-    data.replace(
-
-        [
-            np.inf,
-            -np.inf
-        ],
-
-        np.nan,
-
-        inplace=True
-
-    )
-
-
-    # --------------------------------------------------------
-    # Ensure schema
-    # --------------------------------------------------------
-
-    for column in FINAL_SCHEMA:
-
-        if column not in data.columns:
-
-            data[
-                column
-            ] = np.nan
-
-
-    # --------------------------------------------------------
-    # Exact column order
-    # --------------------------------------------------------
-
-    data = data[
-        FINAL_SCHEMA
-    ]
-
-
-    # --------------------------------------------------------
-    # Convert datetime to string.
-    #
-    # If your existing Feature Group stores datetime_local
-    # as string, this preserves the same representation.
-    # --------------------------------------------------------
-
-    data[
-        "datetime_local"
-    ] = pd.to_datetime(
-        data[
-            "datetime_local"
-        ]
-    ).dt.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-
-    data[
-        "datetime_utc"
-    ] = pd.to_datetime(
-        data[
-            "datetime_utc"
-        ]
-    ).dt.strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-
-    # --------------------------------------------------------
-    # Remove completely duplicated timestamps
-    # --------------------------------------------------------
-
-    data = (
-
-        data
-
-        .drop_duplicates(
-            "datetime_local",
-            keep="last"
-        )
-
-        .sort_values(
-            "datetime_local"
-        )
-
-        .reset_index(
-            drop=True
-        )
-
-    )
-
-
-    return data
-
-
-# ============================================================
-# 19. FIND UNDERLYING FEATURE GROUP
-# ============================================================
-
-def get_feature_group_from_view(
-    feature_view
-):
-
-    print()
-    print("=" * 60)
-    print("FINDING HOPSWORKS FEATURE GROUP")
-    print("=" * 60)
-
-
-    # --------------------------------------------------------
-    # Use datetime_local because it definitely belongs to
-    # the feature schema you provided.
-    # --------------------------------------------------------
-
-    feature = (
-        feature_view
-        .get_feature(
-            "datetime_local"
-        )
-    )
-
-
-    feature_group = (
-        feature.feature_group
-    )
-
-
-    if feature_group is None:
-
-        raise RuntimeError(
-            "Could not determine the underlying "
-            "Feature Group from the Feature View."
-        )
-
-
-    print(
-        "Feature Group:",
-        feature_group.name
-    )
-
-
-    print(
-        "Feature Group version:",
-        feature_group.version
-    )
-
-
-    return feature_group
-
-
-# ============================================================
-# 20. UPSERT INTO HOPSWORKS
-# ============================================================
-
-def upload_to_hopsworks(
-    feature_group,
-    data
-):
-
-    print()
-    print("=" * 60)
-    print("UPLOADING TO HOPSWORKS")
-    print("=" * 60)
-
+def check_required_nulls(data):
+    print("\n" + "=" * 70)
+    print("NULL CHECK BEFORE UPSERT")
+    print("=" * 70)
 
     if data.empty:
+        print("No rows to check.")
+        return pd.DataFrame()
 
-        print(
-            "Nothing to upload."
-        )
+    # Targets are excluded on purpose: future AQI legitimately does
+    # not exist yet for the most recent rows.
+    required_columns = [
+        "datetime_local", "datetime_utc",
+        "temperature", "humidity", "pressure", "wind_speed",
+        "wind_direction", "precipitation", "cloud_cover",
+        "pm25", "aqi",
+        "hour", "day", "month", "year", "day_of_week", "is_weekend",
+        "aqi_lag_1", "aqi_lag_3", "aqi_lag_6", "aqi_lag_12", "aqi_lag_24",
+        "aqi_mean_6", "aqi_std_6",
+        "aqi_mean_12", "aqi_std_12",
+        "aqi_mean_24", "aqi_std_24",
+    ]
 
+    existing_required = [c for c in required_columns if c in data.columns]
+
+    null_counts = data[existing_required].isna().sum()
+    null_counts = null_counts[null_counts > 0]
+
+    if null_counts.empty:
+        print("No NULL values in required columns.")
+        return data
+
+    print("\nColumns containing NULL values:")
+    print(null_counts)
+
+    before = len(data)
+    data = data.dropna(subset=existing_required).copy()
+    print("\nRows removed because required features contain NULL:", before - len(data))
+
+    return data.reset_index(drop=True)
+
+
+# ============================================================
+# 30. PREPARE HOPSWORKS TYPES
+# ============================================================
+
+def prepare_for_hopsworks(data):
+    print("\n" + "=" * 70)
+    print("PREPARING HOPSWORKS DATA TYPES")
+    print("=" * 70)
+
+    if data.empty:
+        return data
+
+    data = data.copy()
+    data.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    for column in FINAL_COLUMNS:
+        if column not in data.columns:
+            data[column] = np.nan
+
+    data = data[FINAL_COLUMNS].copy()
+
+    data["datetime_local"] = pd.to_datetime(data["datetime_local"], errors="coerce")
+
+    # Hopsworks expects datetime_utc as a string, not a timestamp.
+    data["datetime_utc"] = (
+        pd.to_datetime(data["datetime_utc"], errors="coerce")
+        .dt.strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    bigint_columns = ["hour", "day", "month", "year", "day_of_week", "is_weekend"]
+    for column in bigint_columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce").astype("int64")
+
+    numeric_columns = [c for c in FINAL_COLUMNS if c not in ["datetime_local", "datetime_utc"] + bigint_columns]
+    for column in numeric_columns:
+        data[column] = pd.to_numeric(data[column], errors="coerce")
+
+    data = data[data["datetime_local"].notna()].copy()
+
+    data = (
+        data.sort_values("datetime_local")
+        .drop_duplicates(subset=["datetime_local"], keep="last")
+        .reset_index(drop=True)
+    )
+
+    print("Prepared rows:", len(data))
+    return data
+
+
+# ============================================================
+# 31. FINAL NULL CHECK
+# ============================================================
+
+def final_null_check(data):
+    print("\n" + "=" * 70)
+    print("FINAL NULL CHECK")
+    print("=" * 70)
+
+    if data.empty:
+        return False
+
+    required_columns = [
+        "datetime_local", "datetime_utc",
+        "temperature", "humidity", "pressure", "wind_speed",
+        "wind_direction", "precipitation", "cloud_cover",
+        "pm25", "aqi",
+        "hour", "day", "month", "year", "day_of_week", "is_weekend",
+        "aqi_lag_1", "aqi_lag_3", "aqi_lag_6", "aqi_lag_12", "aqi_lag_24",
+        "aqi_mean_6", "aqi_std_6",
+        "aqi_mean_12", "aqi_std_12",
+        "aqi_mean_24", "aqi_std_24",
+    ]
+
+    null_counts = data[required_columns].isna().sum()
+    null_counts = null_counts[null_counts > 0]
+
+    if not null_counts.empty:
+        print("NULL values detected:")
+        print(null_counts)
+        return False
+
+    print("All required feature columns are complete.")
+
+    target_nulls = data[TARGET_COLUMNS].isna().sum()
+    target_nulls = target_nulls[target_nulls > 0]
+
+    if not target_nulls.empty:
+        print("\nTarget NULLs:")
+        print(target_nulls)
+        print("\nTarget NULLs are allowed for the most recent rows, since")
+        print("future AQI is not yet available for them.")
+
+    return True
+
+
+# ============================================================
+# 32. UPSERT INTO HOPSWORKS
+# ============================================================
+
+def upsert_into_hopsworks(fg, data):
+    print("\n" + "=" * 70)
+    print("UPSERTING INTO HOPSWORKS")
+    print("=" * 70)
+
+    if data.empty:
+        print("No rows to upsert.")
         return
 
+    print("Rows:", len(data))
+    print("First:", data["datetime_local"].min())
+    print("Last:", data["datetime_local"].max())
 
-    print(
-        "Rows:",
-        len(data)
-    )
-
-
-    print(
-        "Columns:",
-        len(data.columns)
-    )
-
-
-    # --------------------------------------------------------
-    # Important:
-    #
-    # operation="upsert"
-    #
-    # This allows us to update the previous 72 rows whose
-    # target values may have changed after a new AQI value
-    # became available.
-    #
-    # Hopsworks supports Pandas DataFrames in FeatureGroup
-    # insert().
-    # --------------------------------------------------------
-
-    try:
-
-        result = feature_group.insert(
-
-            data,
-
-            operation="upsert",
-
-            wait=True
-
+    if not final_null_check(data):
+        raise RuntimeError(
+            "Upsert stopped because required feature columns contain NULL values."
         )
 
-    except TypeError:
+    # Relies on the Feature Group's primary key (datetime_local) to
+    # overwrite existing rows in place rather than duplicating them.
+    fg.insert(data, write_options={"wait_for_job": True})
 
-        # Compatibility fallback for Hopsworks versions
-        # where wait is not accepted.
+    print("\nHopsworks upsert completed successfully.")
 
-        result = feature_group.insert(
 
-            data,
+# ============================================================
+# 33. DATA QUALITY REPORT
+# ============================================================
 
-            operation="upsert"
+def print_quality(data):
+    print("\n" + "=" * 70)
+    print("DATA QUALITY")
+    print("=" * 70)
 
-        )
+    if data.empty:
+        print("No rows.")
+        return
 
+    print("Rows:", len(data))
+    print("PM2.5 available:", data["pm25"].notna().sum())
+    print("AQI available:", data["aqi"].notna().sum())
+    print()
+    print("Missing PM2.5:", data["pm25"].isna().sum())
+    print("Missing AQI:", data["aqi"].isna().sum())
+    print()
+
+    for lag in [1, 3, 6, 12, 24]:
+        print(f"AQI lag {lag} available:", data[f"aqi_lag_{lag}"].notna().sum())
 
     print()
-    print(
-        "Hopsworks upload completed."
-    )
-
-
-    return result
-
-
-# ============================================================
-# 21. VALIDATE FINAL DATA
-# ============================================================
-
-def validate_data(
-    data
-):
+    for window in [6, 12, 24]:
+        print(f"AQI mean {window} available:", data[f"aqi_mean_{window}"].notna().sum())
 
     print()
-    print("=" * 60)
-    print("FINAL VALIDATION")
-    print("=" * 60)
-
-
-    missing_columns = [
-
-        column
-
-        for column in FINAL_SCHEMA
-
-        if column not in data.columns
-
-    ]
-
-
-    extra_columns = [
-
-        column
-
-        for column in data.columns
-
-        if column not in FINAL_SCHEMA
-
-    ]
-
-
-    if missing_columns:
-
-        raise RuntimeError(
-            "Missing columns: "
-            + str(missing_columns)
-        )
-
-
-    if extra_columns:
-
-        raise RuntimeError(
-            "Unexpected columns: "
-            + str(extra_columns)
-        )
-
-
-    if list(data.columns) != FINAL_SCHEMA:
-
-        raise RuntimeError(
-            "Column order does not match FINAL_SCHEMA."
-        )
-
-
-    print(
-        "Schema: PASS"
-    )
-
-
-    print(
-        "Rows:",
-        len(data)
-    )
-
-
-    print(
-        "AQI available:",
-        data["aqi"].notna().sum()
-    )
-
-
-    print(
-        "PM2.5 available:",
-        data["pm25"].notna().sum()
-    )
-
-
-    for horizon in [
-
-        1,
-        24,
-        48,
-        72
-
-    ]:
-
-        column = (
-            f"target_aqi_{horizon}"
-        )
-
-
-        print(
-
-            f"{column}:",
-
-            data[
-                column
-            ]
-            .notna()
-            .sum()
-
-        )
+    print("target_aqi_1 NULLs:", data["target_aqi_1"].isna().sum(), "(expect at most 1)")
+    print("target_aqi_72 NULLs:", data["target_aqi_72"].isna().sum(), "(expect up to 72)")
 
 
 # ============================================================
-# 22. MAIN
+# 34. MAIN PIPELINE
 # ============================================================
 
 def main():
-
-    print()
+    print("\n" + "=" * 70)
+    print("KARACHI AQI HOURLY CI/CD PIPELINE (UPSERT DESIGN)")
     print("=" * 70)
-    print("KARACHI AQI HOURLY CI/CD PIPELINE")
-    print("=" * 70)
-
+    print("Run time:", datetime.now())
 
     # --------------------------------------------------------
-    # UPDATE WINDOW
+    # CONNECT
     # --------------------------------------------------------
-
-    update_start, update_end = (
-        get_update_window()
-    )
-
+    project, fs, fg = connect_hopsworks()
 
     # --------------------------------------------------------
-    # HOPSWORKS LOGIN
+    # LAST TIMESTAMP / FETCH WINDOW
     # --------------------------------------------------------
+    last_timestamp = get_last_timestamp(fg)
+    start, end = determine_fetch_window(last_timestamp)
 
-    print()
-    print(
-        "Connecting to Hopsworks..."
-    )
-
-
-    project = hopsworks.login(
-
-        project=PROJECT_NAME,
-
-        api_key_value=HOPSWORKS_API_KEY
-
-    )
-
-
-    print(
-        "Connected to Hopsworks"
-    )
-
+    if start is None:
+        print("\n" + "=" * 70)
+        print("NOTHING NEW TO PROCESS")
+        print("=" * 70)
+        return
 
     # --------------------------------------------------------
-    # FEATURE STORE
+    # READ RECENT HISTORY (CONTEXT FOR LAG/ROLLING/TARGETS)
     # --------------------------------------------------------
+    history = read_recent_history(fg, HISTORY_READ_ROWS)
 
-    fs = project.get_feature_store()
-
-
-    # --------------------------------------------------------
-    # FEATURE VIEW
-    # --------------------------------------------------------
-
-    feature_view = fs.get_feature_view(
-
-        name=FEATURE_VIEW_NAME,
-
-        version=FEATURE_VIEW_VERSION
-
-    )
-
-
-    print(
-        "Feature View:",
-        FEATURE_VIEW_NAME
-    )
-
-
-    print(
-        "Feature View version:",
-        FEATURE_VIEW_VERSION
-    )
-
+    existing_timestamps = set()
+    if not history.empty:
+        existing_timestamps = set(history["datetime_local"].dropna().tolist())
 
     # --------------------------------------------------------
-    # UNDERLYING FEATURE GROUP
+    # FETCH NEW DATA
     # --------------------------------------------------------
+    weather = fetch_open_meteo(start, end)
+    aqi = fetch_openaq_sensor(start, end)
 
-    feature_group = (
-        get_feature_group_from_view(
-            feature_view
-        )
-    )
+    new_data = prepare_new_data(weather, aqi)
 
-
-    # --------------------------------------------------------
-    # FETCH WEATHER
-    # --------------------------------------------------------
-
-    weather = fetch_openmeteo(
-
-        update_start,
-
-        update_end
-
-    )
-
+    if new_data.empty:
+        print("\n" + "=" * 70)
+        print("NO VALID AQI DATA AVAILABLE")
+        print("=" * 70)
+        print("\nNothing to upsert this run.")
+        print("The missing hour will be attempted again on the next CI/CD run.")
+        return
 
     # --------------------------------------------------------
-    # FETCH OPENAQ
+    # COMBINE HISTORY + NEW
     # --------------------------------------------------------
+    combined = combine_history_and_new(history, new_data)
 
-    aqi = fetch_openaq(
-
-        update_start,
-
-        update_end
-
-    )
-
+    if combined.empty:
+        print("Combined dataset is empty.")
+        return
 
     # --------------------------------------------------------
-    # MERGE API SOURCES
+    # FEATURE ENGINEERING OVER THE FULL COMBINED WINDOW
     # --------------------------------------------------------
-
-    new_data = merge_sources(
-
-        weather,
-
-        aqi
-
-    )
-
+    engineered = engineer_features(combined)
 
     # --------------------------------------------------------
-    # LOAD LAST 72 HOURS FROM HOPSWORKS
-    #
-    # This is the important part for your stated logic.
+    # SELECT UPSERT CANDIDATES
+    # (new rows + existing rows whose targets may have changed)
     # --------------------------------------------------------
+    upsert_rows = select_upsert_rows(engineered, history)
 
-    history = load_hopsworks_history(
+    print("\n" + "=" * 70)
+    print("UPSERT CANDIDATES BEFORE NULL CHECK:", len(upsert_rows))
 
-        feature_view,
-
-        update_start,
-
-        update_end
-
-    )
-
-
-    # --------------------------------------------------------
-    # COMBINE
-    # --------------------------------------------------------
-
-    combined = combine_history_and_new(
-
-        history,
-
-        new_data
-
-    )
-
+    if not upsert_rows.empty:
+        new_count = (~upsert_rows["datetime_local"].isin(existing_timestamps)).sum()
+        backfill_count = len(upsert_rows) - new_count
+        print("  - brand-new rows:", new_count)
+        print("  - existing rows eligible for target backfill:", backfill_count)
+        print("First:", upsert_rows["datetime_local"].min())
+        print("Last:", upsert_rows["datetime_local"].max())
 
     # --------------------------------------------------------
-    # APPLY 3-DAY / LOCAL TIME RULE
+    # REMOVE ROWS WITH NULL REQUIRED (NON-TARGET) FEATURES
     # --------------------------------------------------------
+    upsert_rows = check_required_nulls(upsert_rows)
 
-    combined = apply_three_day_rule(
-        combined
-    )
-
-
-    # --------------------------------------------------------
-    # SELECT ONLY ROWS THAT NEED TO BE UPSERTED
-    # --------------------------------------------------------
-
-    update_rows = select_update_rows(
-
-        combined,
-
-        update_start,
-
-        update_end
-
-    )
-
+    if upsert_rows.empty:
+        print("\n" + "=" * 70)
+        print("NO VALID ROWS REMAIN AFTER NULL CHECK")
+        print("=" * 70)
+        print("\nNothing upserted.")
+        return
 
     # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # Don't upload rows where there is no AQI at all.
-    #
-    # Weather alone cannot produce your AQI target.
+    # QUALITY REPORT
     # --------------------------------------------------------
-
-    update_rows = update_rows[
-        update_rows[
-            "aqi"
-        ].notna()
-    ].copy()
-
+    print_quality(upsert_rows)
 
     # --------------------------------------------------------
-    # FINAL SCHEMA
+    # PREPARE TYPES + UPSERT
     # --------------------------------------------------------
-
-    final_data = prepare_final_data(
-
-        update_rows
-
-    )
-
+    upsert_rows = prepare_for_hopsworks(upsert_rows)
+    upsert_into_hopsworks(fg, upsert_rows)
 
     # --------------------------------------------------------
-    # VALIDATION
+    # COMPLETE
     # --------------------------------------------------------
-
-    validate_data(
-
-        final_data
-
-    )
-
-
-    # --------------------------------------------------------
-    # UPLOAD
-    # --------------------------------------------------------
-
-    upload_to_hopsworks(
-
-        feature_group,
-
-        final_data
-
-    )
-
-
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
+    print("\n" + "=" * 70)
     print("PIPELINE COMPLETED SUCCESSFULLY")
     print("=" * 70)
-
-
-    print(
-        "OpenAQ sensor:",
-        OPENAQ_SENSOR_ID
-    )
-
-
-    print(
-        "Location:",
-        OPENAQ_LOCATION_NAME
-    )
-
-
-    print(
-        "Rows uploaded:",
-        len(final_data)
-    )
-
-
-    if not final_data.empty:
-
-        print(
-            "First timestamp:",
-            final_data[
-                "datetime_local"
-            ].iloc[0]
-        )
-
-
-        print(
-            "Last timestamp:",
-            final_data[
-                "datetime_local"
-            ].iloc[-1]
-        )
-
-
-    print(
-        "Feature View:",
-        f"{FEATURE_VIEW_NAME} "
-        f"v{FEATURE_VIEW_VERSION}"
-    )
-
-
+    print("Upserted rows:", len(upsert_rows))
+    print("Upserted from:", upsert_rows["datetime_local"].min())
+    print("Upserted through:", upsert_rows["datetime_local"].max())
+    print()
+    print("OpenAQ Sensor:", OPENAQ_SENSOR_ID)
+    print("OpenAQ Location:", OPENAQ_LOCATION_ID)
+    print("Feature Group:", FEATURE_GROUP_NAME, "v", FEATURE_GROUP_VERSION)
+    print()
+    print("History rows read for context:", HISTORY_READ_ROWS)
+    print("Lookback buffer rows (not upserted):", LOOKBACK_BUFFER_ROWS)
     print("=" * 70)
 
 
 # ============================================================
-# 23. RUN
+# 35. ERROR HANDLING
 # ============================================================
 
 if __name__ == "__main__":
-
     try:
-
         main()
-
-    except Exception as error:
-
-        print()
-        print("=" * 70)
+    except KeyboardInterrupt:
+        print("\nPipeline interrupted.")
+        sys.exit(130)
+    except Exception as exc:
+        print("\n" + "=" * 70)
         print("PIPELINE FAILED")
         print("=" * 70)
-
-        print(
-            type(error).__name__,
-            ":",
-            error
-        )
-
+        print(type(exc).__name__, ":", exc)
         raise
