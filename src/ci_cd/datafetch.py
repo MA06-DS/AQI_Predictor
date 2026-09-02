@@ -59,7 +59,7 @@ import pandas as pd
 from datetime import datetime
 import hopsworks
 from dotenv import load_dotenv
-
+import datalake
 
 # ============================================================
 # 2. ENVIRONMENT
