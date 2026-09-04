@@ -112,7 +112,7 @@ jobs:
           echo ""
           echo "Running XGBoost training..."
 
-          python xgboost_model_registry.py
+          python src/ci_cd/xgboost_model_registry.py
 
           echo ""
           echo "=========================================="
