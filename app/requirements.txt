@@ -10,3 +10,4 @@ hops-deltalake
 joblib
 xgboost==2.1.1
 scikit-learn
+setuptools<81
