@@ -6,6 +6,7 @@ pyarrow==24.0.0
 requests
 python-dotenv
 hopsworks==5.0.6
-xgboost==2.1.4
+xgboost==3.2.0
 setuptools<81
 great-expectations==0.18.12
+scikit-learn==1.9.0
