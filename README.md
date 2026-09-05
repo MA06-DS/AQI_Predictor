@@ -7,6 +7,10 @@ horizon-specific forecasting models, registers the models in Hopsworks Model
 Registry, and serves the latest readings and forecasts through a Streamlit
 dashboard.
 
+## Live Dashboard
+
+Use the deployed application here: [Karachi AQI Predictor](https://anaskaaqi.streamlit.app/)
+
 The dashboard predicts AQI for four horizons:
 
 - One hour ahead
