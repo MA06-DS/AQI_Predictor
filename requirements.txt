@@ -1,6 +1,11 @@
-numpy
+numpy==2.4.6
 pandas
 requests
 python-dotenv
 hopsworks
 pyarrow
+hsfs
+hops-deltalake
+joblib
+xgboost
+scikit-learn
