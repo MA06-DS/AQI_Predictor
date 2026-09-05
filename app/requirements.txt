@@ -1,9 +1,11 @@
-# Runtime dependencies for app/app.py
-hopsworks==5.0.6
-numpy==2.4.6
-pandas==2.3.3
-plotly>=5.18
-python-dotenv
 streamlit>=1.36
-xgboost>=2.1.
+plotly>=5.18
+numpy==1.26.4
+pandas==2.3.3
+pyarrow==24.0.0
+requests
+python-dotenv
+hopsworks==5.0.6
+xgboost==2.1.1
+setuptools<81
 great-expectations==0.18.12
